@@ -19,6 +19,7 @@ package config
 import (
 	"time"
 
+	kubelet_config "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	scheduler_config "k8s.io/kubernetes/pkg/scheduler/apis/config"
 )
 
@@ -125,7 +126,11 @@ type AutoscalingOptions struct {
 	IgnoreMirrorPodsUtilization bool
 	// MaxGracefulTerminationSec is maximum number of seconds scale down waits for pods to terminate before
 	// removing the node from cloud provider.
+	// MaxGracefulTerminationSec will not be applicable when the scale-down-drain-node-priority-and-grace-periods flag is set
 	MaxGracefulTerminationSec int
+	// DrainPriorityConfig is a list of ShutdownGracePeriodByPodPriority.
+	// If the scale-down-drain-node-priority-and-grace-periods flag is not set, the config will be a single group with ShutdownGracePeriodSeconds set to MaxGracefulTerminationSec
+	DrainPriorityConfig []kubelet_config.ShutdownGracePeriodByPodPriority
 	// MaxTotalUnreadyPercentage is the maximum percentage of unready nodes after which CA halts operations
 	MaxTotalUnreadyPercentage float64
 	// OkTotalUnreadyCount is the number of allowed unready nodes, irrespective of max-total-unready-percentage

@@ -17,11 +17,13 @@ limitations under the License.
 package actuation
 
 import (
+	"math"
 	"strings"
 	"time"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	kubelet_config "k8s.io/kubernetes/pkg/kubelet/apis/config"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
@@ -66,14 +68,22 @@ type actuatorNodeGroupConfigGetter interface {
 	GetIgnoreDaemonSetsUtilization(nodeGroup cloudprovider.NodeGroup) (bool, error)
 }
 
+// TODO(damika): consider removing drainablilityRules from the actuator
 // NewActuator returns a new instance of Actuator.
 func NewActuator(ctx *context.AutoscalingContext, csr *clusterstate.ClusterStateRegistry, ndt *deletiontracker.NodeDeletionTracker, deleteOptions options.NodeDeleteOptions, drainabilityRules rules.Rules, configGetter actuatorNodeGroupConfigGetter) *Actuator {
 	ndb := NewNodeDeletionBatcher(ctx, csr, ndt, ctx.NodeDeletionBatcherInterval)
+	legacyFlagDrainConfig := SingleRuleDrainConfig(ctx.MaxGracefulTerminationSec)
+	var evictor Evictor
+	if len(ctx.DrainPriorityConfig) > 0 {
+		evictor = NewEvictor(ndt, ctx.DrainPriorityConfig, true)
+	} else {
+		evictor = NewEvictor(ndt, legacyFlagDrainConfig, false)
+	}
 	return &Actuator{
 		ctx:                       ctx,
 		clusterState:              csr,
 		nodeDeletionTracker:       ndt,
-		nodeDeletionScheduler:     NewGroupDeletionScheduler(ctx, ndt, ndb, NewDefaultEvictor(deleteOptions, drainabilityRules, ndt)),
+		nodeDeletionScheduler:     NewGroupDeletionScheduler(ctx, ndt, ndb, evictor, deleteOptions, drainabilityRules),
 		budgetProcessor:           budgets.NewScaleDownBudgetProcessor(ctx),
 		deleteOptions:             deleteOptions,
 		drainabilityRules:         drainabilityRules,
@@ -375,4 +385,13 @@ func joinPodNames(pods []*apiv1.Pod) string {
 		names = append(names, pod.Name)
 	}
 	return strings.Join(names, ",")
+}
+
+func SingleRuleDrainConfig(shutdownGracePeriodSeconds int) []kubelet_config.ShutdownGracePeriodByPodPriority {
+	return []kubelet_config.ShutdownGracePeriodByPodPriority{
+		{
+			Priority:                   math.MaxInt32,
+			ShutdownGracePeriodSeconds: int64(shutdownGracePeriodSeconds),
+		},
+	}
 }

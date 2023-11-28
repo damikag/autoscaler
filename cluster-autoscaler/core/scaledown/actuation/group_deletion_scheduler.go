@@ -21,6 +21,10 @@ import (
 	"time"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/drainability/rules"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/options"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/daemonset"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 
@@ -45,17 +49,21 @@ type GroupDeletionScheduler struct {
 	nodeDeletionTracker *deletiontracker.NodeDeletionTracker
 	nodeDeletionBatcher batcher
 	evictor             Evictor
+	deleteOptions       options.NodeDeleteOptions
+	drainabilityRules   rules.Rules
 	nodeQueue           map[string][]*apiv1.Node
 	failuresForGroup    map[string]bool
 }
 
 // NewGroupDeletionScheduler creates an instance of GroupDeletionScheduler.
-func NewGroupDeletionScheduler(ctx *context.AutoscalingContext, ndt *deletiontracker.NodeDeletionTracker, b batcher, evictor Evictor) *GroupDeletionScheduler {
+func NewGroupDeletionScheduler(ctx *context.AutoscalingContext, ndt *deletiontracker.NodeDeletionTracker, b batcher, evictor Evictor, deleteOptions options.NodeDeleteOptions, drainabilityRules rules.Rules) *GroupDeletionScheduler {
 	return &GroupDeletionScheduler{
 		ctx:                 ctx,
 		nodeDeletionTracker: ndt,
 		nodeDeletionBatcher: b,
 		evictor:             evictor,
+		deleteOptions:       deleteOptions,
+		drainabilityRules:   drainabilityRules,
 		nodeQueue:           map[string][]*apiv1.Node{},
 		failuresForGroup:    map[string]bool{},
 	}
@@ -100,13 +108,20 @@ func (ds *GroupDeletionScheduler) ScheduleDeletion(nodeInfo *framework.NodeInfo,
 func (ds *GroupDeletionScheduler) prepareNodeForDeletion(nodeInfo *framework.NodeInfo, drain bool) status.NodeDeleteResult {
 	node := nodeInfo.Node()
 	if drain {
-		if evictionResults, err := ds.evictor.DrainNode(ds.ctx, nodeInfo); err != nil {
+		dsPods, pods := podsToEvict(ds.ctx, nodeInfo)
+		if evictionResults, err := ds.evictor.DrainNode(ds.ctx, node, pods, dsPods); err != nil {
 			return status.NodeDeleteResult{ResultType: status.NodeDeleteErrorFailedToEvictPods, Err: err, PodEvictionResults: evictionResults}
 		}
 	} else {
-		if err := ds.evictor.EvictDaemonSetPods(ds.ctx, nodeInfo, time.Now()); err != nil {
-			// Evicting DS pods is best-effort, so proceed with the deletion even if there are errors.
+		_, daemonSetPods, _, err := simulator.GetPodsToMove(nodeInfo, ds.deleteOptions, ds.drainabilityRules, nil, nil, time.Now())
+		if err != nil {
 			klog.Warningf("Error while evicting DS pods from an empty node %q: %v", node.Name, err)
+		} else {
+			daemonSetPods = daemonset.PodsToEvict(daemonSetPods, ds.ctx.DaemonSetEvictionForEmptyNodes)
+			if _, err = ds.evictor.DrainNode(ds.ctx, node, nil, daemonSetPods); err != nil {
+				// Evicting DS pods is best-effort, so proceed with the deletion even if there are errors.
+				klog.Warningf("Error while evicting DS pods from an empty node %q: %v", node.Name, err)
+			}
 		}
 	}
 	if err := WaitForDelayDeletion(node, ds.ctx.ListerRegistry.AllNodeLister(), ds.ctx.AutoscalingOptions.NodeDeletionDelayTimeout); err != nil {

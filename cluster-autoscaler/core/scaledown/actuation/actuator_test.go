@@ -32,9 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
-	core "k8s.io/client-go/testing"
-
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
@@ -44,10 +41,14 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/status"
 	. "k8s.io/autoscaler/cluster-autoscaler/core/test"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupconfig"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/drainability/rules"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/options"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/utilization"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
 	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
+	"k8s.io/client-go/kubernetes/fake"
+	core "k8s.io/client-go/testing"
 )
 
 type nodeGroupViewInfo struct {
@@ -1190,10 +1191,12 @@ func TestStartDeletion(t *testing.T) {
 				// Create Actuator, run StartDeletion, and verify the error.
 				ndt := deletiontracker.NewNodeDeletionTracker(0)
 				ndb := NewNodeDeletionBatcher(&ctx, csr, ndt, 0*time.Second)
-				evictor := Evictor{EvictionRetryTime: 0, DsEvictionRetryTime: 0, DsEvictionEmptyNodeTimeout: 0, PodEvictionHeadroom: DefaultPodEvictionHeadroom}
+				legacyFlagDrainConfig := SingleRuleDrainConfig(ctx.MaxGracefulTerminationSec)
+				evictor := Evictor{EvictionRetryTime: 0, PodEvictionHeadroom: DefaultPodEvictionHeadroom, shutdownGracePeriodByPodPriority: legacyFlagDrainConfig, priorityEvictorEnabled: false}
+				deleteOptions := options.NewNodeDeleteOptions(opts)
 				actuator := Actuator{
 					ctx: &ctx, clusterState: csr, nodeDeletionTracker: ndt,
-					nodeDeletionScheduler: NewGroupDeletionScheduler(&ctx, ndt, ndb, evictor),
+					nodeDeletionScheduler: NewGroupDeletionScheduler(&ctx, ndt, ndb, evictor, deleteOptions, rules.Default(deleteOptions)),
 					budgetProcessor:       budgets.NewScaleDownBudgetProcessor(&ctx),
 					configGetter:          nodegroupconfig.NewDefaultNodeGroupConfigProcessor(ctx.NodeGroupDefaults),
 				}
@@ -1426,10 +1429,12 @@ func TestStartDeletionInBatchBasic(t *testing.T) {
 			csr := clusterstate.NewClusterStateRegistry(provider, clusterstate.ClusterStateRegistryConfig{}, ctx.LogRecorder, NewBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute}))
 			ndt := deletiontracker.NewNodeDeletionTracker(0)
 			ndb := NewNodeDeletionBatcher(&ctx, csr, ndt, deleteInterval)
-			evictor := Evictor{EvictionRetryTime: 0, DsEvictionRetryTime: 0, DsEvictionEmptyNodeTimeout: 0, PodEvictionHeadroom: DefaultPodEvictionHeadroom}
+			legacyFlagDrainConfig := SingleRuleDrainConfig(ctx.MaxGracefulTerminationSec)
+			evictor := Evictor{EvictionRetryTime: 0, PodEvictionHeadroom: DefaultPodEvictionHeadroom, shutdownGracePeriodByPodPriority: legacyFlagDrainConfig}
+			deleteOptions := options.NewNodeDeleteOptions(opts)
 			actuator := Actuator{
 				ctx: &ctx, clusterState: csr, nodeDeletionTracker: ndt,
-				nodeDeletionScheduler: NewGroupDeletionScheduler(&ctx, ndt, ndb, evictor),
+				nodeDeletionScheduler: NewGroupDeletionScheduler(&ctx, ndt, ndb, evictor, deleteOptions, rules.Default(deleteOptions)),
 				budgetProcessor:       budgets.NewScaleDownBudgetProcessor(&ctx),
 			}
 

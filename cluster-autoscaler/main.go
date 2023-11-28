@@ -29,6 +29,11 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/actuation"
+	"k8s.io/autoscaler/cluster-autoscaler/debuggingsnapshot"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/predicatechecker"
+	kubelet_config "k8s.io/kubernetes/pkg/kubelet/apis/config"
+
 	"github.com/spf13/pflag"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -41,7 +46,6 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/core"
 	"k8s.io/autoscaler/cluster-autoscaler/core/podlistprocessor"
-	"k8s.io/autoscaler/cluster-autoscaler/debuggingsnapshot"
 	"k8s.io/autoscaler/cluster-autoscaler/estimator"
 	"k8s.io/autoscaler/cluster-autoscaler/expander"
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
@@ -54,7 +58,6 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/drainability/rules"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/options"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator/predicatechecker"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	scheduler_util "k8s.io/autoscaler/cluster-autoscaler/utils/scheduler"
@@ -244,6 +247,11 @@ var (
 	forceDaemonSets                         = flag.Bool("force-ds", false, "Blocks scale-up of node groups too small for all suitable Daemon Sets pods.")
 	dynamicNodeDeleteDelayAfterTaintEnabled = flag.Bool("dynamic-node-delete-delay-after-taint-enabled", false, "Enables dynamic adjustment of NodeDeleteDelayAfterTaint based of the latency between CA and api-server")
 	bypassedSchedulers                      = pflag.StringSlice("bypassed-scheduler-names", []string{}, fmt.Sprintf("Names of schedulers to bypass. If set to non-empty value, CA will not wait for pods to reach a certain age before triggering a scale-up."))
+	scaleDownDrainNodeBasedOnPodPriority    = flag.String("scale-down-drain-node-priority-and-grace-periods", "",
+		"List of ',' separated pairs (priority:shutDownGracePeriodSeconds) of integers separated by ':' enables priority evictor. Priority evictor groups pods into priority groups based on pod priority and evict pods in the ascending order of group priorities"+
+			"--max-graceful-termination-sec flag should not be set when this flag is set. Not setting this flag will use unordered evictor by default."+
+			"Priority evictor reuses the concepts of drain logic in kubelet(https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2712-pod-priority-based-graceful-node-shutdown#migration-from-the-node-graceful-shutdown-feature)."+
+			"Eg. flag usage:  '10000:20,1000:100,0:60'")
 )
 
 func isFlagPassed(name string) bool {
@@ -296,6 +304,18 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 		klog.Fatalf("Failed to get scheduler config: %v", err)
 	}
 
+	if isFlagPassed("scale-down-drain-node-priority-and-grace-periods") && isFlagPassed("max-graceful-termination-sec") {
+		klog.Fatalf("Invalid configuration, could not use --scale-down-drain-node-priority-and-grace-periods together with --max-graceful-termination-sec")
+	}
+
+	var scaleDownDrainNodeBasedOnPodPriorityMap []kubelet_config.ShutdownGracePeriodByPodPriority
+	if isFlagPassed("scale-down-drain-node-priority-and-grace-periods") {
+		scaleDownDrainNodeBasedOnPodPriorityMap = actuation.ParseShutdownGracePeriodsAndPriorities(*scaleDownDrainNodeBasedOnPodPriority)
+		if len(scaleDownDrainNodeBasedOnPodPriorityMap) == 0 {
+			klog.Fatalf("Invalid configuration, parsing --scale-down-drain-node-priority-and-grace-periods")
+		}
+	}
+
 	return config.AutoscalingOptions{
 		NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
 			ScaleDownUtilizationThreshold:    *scaleDownUtilizationThreshold,
@@ -338,6 +358,7 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 		ScaleDownNonEmptyCandidatesCount: *scaleDownNonEmptyCandidatesCount,
 		ScaleDownCandidatesPoolRatio:     *scaleDownCandidatesPoolRatio,
 		ScaleDownCandidatesPoolMinCount:  *scaleDownCandidatesPoolMinCount,
+		DrainPriorityConfig:              scaleDownDrainNodeBasedOnPodPriorityMap,
 		SchedulerConfig:                  parsedSchedConfig,
 		WriteStatusConfigMap:             *writeStatusConfigMapFlag,
 		StatusConfigMapName:              *statusConfigMapName,
