@@ -46,6 +46,58 @@ var (
 			Name:    "mig",
 		},
 	}
+	mig1 = &gceMig{
+		gceRef: GceRef{
+			Project: "myprojid",
+			Zone:    "myzone1",
+			Name:    "mig1",
+		},
+	}
+	mig2 = &gceMig{
+		gceRef: GceRef{
+			Project: "myprojid",
+			Zone:    "myzone2",
+			Name:    "mig2",
+		},
+	}
+
+	instance1 = GceInstance{
+		Instance: cloudprovider.Instance{
+			Id:     "gce://myprojid/myzone1/test-instance-1",
+			Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceRunning},
+		},
+		Igm: mig1.GceRef(),
+	}
+	instance2 = GceInstance{
+		Instance: cloudprovider.Instance{
+			Id:     "gce://myprojid/myzone1/test-instance-2",
+			Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceCreating},
+		},
+		Igm: mig1.GceRef(),
+	}
+	instance3 = GceInstance{
+		Instance: cloudprovider.Instance{
+			Id:     "gce://myprojid/myzone2/test-instance-3",
+			Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceRunning},
+		},
+		Igm: mig2.GceRef(),
+	}
+
+	instance4 = GceInstance{
+		Instance: cloudprovider.Instance{
+			Id:     "gce://myprojid/myzone2/test-instance-4",
+			Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceRunning},
+		},
+		Igm: GceRef{},
+	}
+
+	instance5 = GceInstance{
+		Instance: cloudprovider.Instance{
+			Id:     "gce://myprojid/myzone2/test-instance-5",
+			Status: &cloudprovider.InstanceStatus{State: cloudprovider.InstanceRunning},
+		},
+		Igm: GceRef{},
+	}
 )
 
 type mockAutoscalingGceClient struct {
@@ -1436,6 +1488,304 @@ func TestMultipleGetMigInstanceCallsLimited(t *testing.T) {
 	}
 }
 
+func TestListInstancesInAllZonesWithMigs(t *testing.T) {
+	testCases := []struct {
+		name          string
+		migs          map[GceRef]Mig
+		allInstances  map[string][]GceInstance
+		wantInstances []GceInstance
+		wantErr       bool
+	}{
+		{
+			name:         "instance fetching failed",
+			migs:         map[GceRef]Mig{mig1.GceRef(): mig1},
+			allInstances: map[string][]GceInstance{},
+			wantErr:      true,
+		},
+		{
+			name:          "Successfully list mig instances in a single zone",
+			migs:          map[GceRef]Mig{mig1.GceRef(): mig1},
+			allInstances:  map[string][]GceInstance{"myzone1": {instance1, instance2}, "myzone2": {instance3}},
+			wantInstances: []GceInstance{instance1, instance2},
+		},
+		{
+			name:          "Successfully list mig instances in multiple zones",
+			migs:          map[GceRef]Mig{mig1.GceRef(): mig1, mig2.GceRef(): mig2},
+			allInstances:  map[string][]GceInstance{"myzone1": {instance1, instance2}, "myzone2": {instance3}},
+			wantInstances: []GceInstance{instance1, instance2, instance3},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := GceCache{
+				migs: tc.migs,
+			}
+			client := &mockAutoscalingGceClient{
+				fetchAllInstances: func(project, zone, filter string) ([]GceInstance, error) {
+					return fetchAllInstanceInZone(tc.allInstances, zone)
+				},
+			}
+			migLister := NewMigLister(&cache)
+			provider := &cachingMigInfoProvider{
+				cache:     &cache,
+				migLister: migLister,
+				gceClient: client,
+			}
+			instances, err := provider.listInstancesInAllZonesWithMigs()
+
+			if tc.wantErr {
+				assert.NotNil(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantInstances, instances)
+		})
+	}
+}
+
+func TestGroupInstancesToMigs(t *testing.T) {
+	testCases := []struct {
+		name      string
+		instances []GceInstance
+		want      map[GceRef][]GceInstance
+	}{
+		{
+			name: "no instances",
+			want: map[GceRef][]GceInstance{},
+		},
+		{
+			name:      "instances from multiple migs including unknown migs",
+			instances: []GceInstance{instance1, instance2, instance3, instance4, instance5},
+			want: map[GceRef][]GceInstance{
+				mig1.GceRef(): {instance1, instance2},
+				mig2.GceRef(): {instance3},
+				GceRef{}:      {instance4, instance5},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			groupedInstances := groupInstancesToMigs(tc.instances)
+			assert.Equal(t, tc.want, groupedInstances)
+		})
+	}
+}
+
+func TestIsMigInstancesInconsistent(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		mig                    Mig
+		migToInstances         map[GceRef][]GceInstance
+		migInstancesStateCache map[GceRef]map[cloudprovider.InstanceState]int64
+		want                   bool
+	}{
+		{
+			name:           "instance not found",
+			mig:            mig1,
+			migToInstances: map[GceRef][]GceInstance{},
+			want:           true,
+		},
+		{
+			name:           "instanceState not found",
+			mig:            mig1,
+			migToInstances: map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+			want:           true,
+		},
+		{
+			name:           "inconsistent number of instances",
+			mig:            mig1,
+			migToInstances: map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {
+					cloudprovider.InstanceCreating: 2,
+					cloudprovider.InstanceDeleting: 3,
+					cloudprovider.InstanceRunning:  4,
+				},
+			},
+			want: true,
+		},
+		{
+			name:           "consistent number of instances",
+			mig:            mig1,
+			migToInstances: map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {
+					cloudprovider.InstanceCreating: 1,
+					cloudprovider.InstanceDeleting: 0,
+					cloudprovider.InstanceRunning:  1,
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := GceCache{
+				migInstancesStateCache: tc.migInstancesStateCache,
+			}
+			provider := &cachingMigInfoProvider{
+				cache: &cache,
+			}
+			got := provider.isMigInstancesInconsistent(tc.mig, tc.migToInstances)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestIsMigInCreatingOrDeletingInstanceState(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		mig                    Mig
+		migInstancesStateCache map[GceRef]map[cloudprovider.InstanceState]int64
+		want                   bool
+	}{
+		{
+			name: "instanceState not found",
+			mig:  mig1,
+			want: false,
+		},
+		{
+			name: "in creating state",
+			mig:  mig1,
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {
+					cloudprovider.InstanceCreating: 2,
+					cloudprovider.InstanceDeleting: 0,
+					cloudprovider.InstanceRunning:  1,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "in deleting state",
+			mig:  mig1,
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {
+					cloudprovider.InstanceCreating: 0,
+					cloudprovider.InstanceDeleting: 1,
+					cloudprovider.InstanceRunning:  0,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "not in creating or deleting states",
+			mig:  mig1,
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {
+					cloudprovider.InstanceCreating: 0,
+					cloudprovider.InstanceDeleting: 0,
+					cloudprovider.InstanceRunning:  1,
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := GceCache{
+				migInstancesStateCache: tc.migInstancesStateCache,
+			}
+			provider := &cachingMigInfoProvider{
+				cache: &cache,
+			}
+			got := provider.isMigInCreatingOrDeletingInstanceState(tc.mig)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestUpdateMigInstancesCache(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		migs                   map[GceRef]Mig
+		migToInstances         map[GceRef][]GceInstance
+		fetchMigInstances      []GceInstance
+		wantInstances          map[GceRef][]GceInstance
+		migInstancesStateCache map[GceRef]map[cloudprovider.InstanceState]int64
+	}{
+		{
+			name: "inconsistent mig instance state",
+			migs: map[GceRef]Mig{mig1.GceRef(): mig1},
+			migToInstances: map[GceRef][]GceInstance{
+				mig1.GceRef(): {instance1},
+			},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {cloudprovider.InstanceRunning: 2, cloudprovider.InstanceDeleting: 0, cloudprovider.InstanceCreating: 0},
+			},
+			fetchMigInstances: []GceInstance{instance1, instance2},
+			wantInstances:     map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+		},
+		{
+			name: "mig with instance in creating or deleting state",
+			migs: map[GceRef]Mig{mig1.GceRef(): mig1},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {cloudprovider.InstanceRunning: 0, cloudprovider.InstanceDeleting: 0, cloudprovider.InstanceCreating: 2},
+			},
+			fetchMigInstances: []GceInstance{instance1, instance2},
+			wantInstances:     map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+		},
+		{
+			name: "consistent mig instance state",
+			migs: map[GceRef]Mig{mig1.GceRef(): mig1},
+			migToInstances: map[GceRef][]GceInstance{
+				mig1.GceRef(): {instance1, instance2},
+			},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {cloudprovider.InstanceRunning: 2, cloudprovider.InstanceDeleting: 0, cloudprovider.InstanceCreating: 0},
+			},
+			wantInstances: map[GceRef][]GceInstance{mig1.GceRef(): {instance1, instance2}},
+		},
+		{
+			name: "mix of consistent and inconsistent states",
+			migs: map[GceRef]Mig{mig1.GceRef(): mig1, mig2.GceRef(): mig2},
+			migToInstances: map[GceRef][]GceInstance{
+				mig1.GceRef(): {instance1, instance2},
+			},
+			migInstancesStateCache: map[GceRef]map[cloudprovider.InstanceState]int64{
+				mig1.GceRef(): {cloudprovider.InstanceRunning: 2, cloudprovider.InstanceDeleting: 0, cloudprovider.InstanceCreating: 0},
+				mig2.GceRef(): {cloudprovider.InstanceRunning: 1, cloudprovider.InstanceDeleting: 0, cloudprovider.InstanceCreating: 0},
+			},
+			fetchMigInstances: []GceInstance{instance3},
+			wantInstances: map[GceRef][]GceInstance{
+				mig1.GceRef(): {instance1, instance2},
+				mig2.GceRef(): {instance3},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := GceCache{
+				migs:                   tc.migs,
+				instances:              make(map[GceRef][]GceInstance),
+				instancesUpdateTime:    make(map[GceRef]time.Time),
+				migBaseNameCache:       make(map[GceRef]string),
+				migInstancesStateCache: tc.migInstancesStateCache,
+				instancesToMig:         make(map[GceRef]GceRef),
+			}
+			migLister := NewMigLister(&cache)
+			client := &mockAutoscalingGceClient{
+				fetchMigInstances: fetchMigInstancesConst(tc.fetchMigInstances),
+			}
+			provider := &cachingMigInfoProvider{
+				cache:        &cache,
+				migLister:    migLister,
+				gceClient:    client,
+				timeProvider: &realTime{},
+			}
+			err := provider.updateMigInstancesCache(tc.migToInstances)
+			assert.NoError(t, err)
+			for migRef, want := range tc.wantInstances {
+				instances, found := cache.GetMigInstances(migRef)
+				assert.True(t, found)
+				assert.Equal(t, want, instances)
+			}
+		})
+	}
+}
+
 type fakeTime struct {
 	now time.Time
 }
@@ -1554,4 +1904,12 @@ func fetchMachineTypeConst(name string, cpu int64, mem int64) func(string, strin
 			MemoryMb:  mem,
 		}, nil
 	}
+}
+
+func fetchAllInstanceInZone(allInstances map[string][]GceInstance, zone string) ([]GceInstance, error) {
+	instances, found := allInstances[zone]
+	if !found {
+		return nil, errors.New("")
+	}
+	return instances, nil
 }
